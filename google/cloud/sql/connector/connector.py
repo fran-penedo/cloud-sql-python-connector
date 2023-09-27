@@ -145,16 +145,16 @@ class Connector:
         :returns:
             A DB-API connection to the specified Cloud SQL instance.
         """
-        try:
-            # check if event loop is running in current thread
-            if self._loop == asyncio.get_running_loop():
-                raise ConnectorLoopError(
-                    "Connector event loop is running in current thread!"
-                    "Event loop must be attached to a different thread to prevent blocking code!"
-                )
-        # asyncio.get_running_loop will throw RunTimeError if no running loop is present
-        except RuntimeError:
-            pass
+        # try:
+        #     # check if event loop is running in current thread
+        #     if self._loop == asyncio.get_running_loop():
+        #         raise ConnectorLoopError(
+        #             "Connector event loop is running in current thread!"
+        #             "Event loop must be attached to a different thread to prevent blocking code!"
+        #         )
+        # # asyncio.get_running_loop will throw RunTimeError if no running loop is present
+        # except RuntimeError:
+        #     pass
 
         # if event loop is not in current thread, proceed with connection
         connect_task = asyncio.run_coroutine_threadsafe(
