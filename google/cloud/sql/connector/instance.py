@@ -13,41 +13,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 from __future__ import annotations
 
 import asyncio
 from enum import Enum
 import logging
+import re
 import ssl
 from tempfile import TemporaryDirectory
-from typing import (
-    Any,
-    Dict,
-    Optional,
-    Tuple,
-    TYPE_CHECKING,
-)
+from typing import Any, Dict, Tuple, TYPE_CHECKING
 
 import aiohttp
-from cryptography.hazmat.backends import default_backend
-from cryptography.x509 import load_pem_x509_certificate
 
-from google.auth.credentials import Credentials
-from google.cloud.sql.connector.exceptions import (
-    AutoIAMAuthNotSupported,
-    CloudSQLIPTypeError,
-    CredentialsTypeError,
-    TLSVersionError,
-)
+from google.cloud.sql.connector.client import CloudSQLClient
+from google.cloud.sql.connector.exceptions import AutoIAMAuthNotSupported
+from google.cloud.sql.connector.exceptions import CloudSQLIPTypeError
+from google.cloud.sql.connector.exceptions import TLSVersionError
 from google.cloud.sql.connector.rate_limiter import AsyncRateLimiter
-from google.cloud.sql.connector.refresh_utils import (
-    _get_ephemeral,
-    _get_metadata,
-    _is_valid,
-    _seconds_until_refresh,
-)
-from google.cloud.sql.connector.utils import _auth_init, write_to_file
-from google.cloud.sql.connector.version import __version__ as version
+from google.cloud.sql.connector.refresh_utils import _is_valid
+from google.cloud.sql.connector.refresh_utils import _seconds_until_refresh
+from google.cloud.sql.connector.utils import write_to_file
 
 if TYPE_CHECKING:
     import datetime
@@ -56,6 +42,22 @@ logger = logging.getLogger(name=__name__)
 
 APPLICATION_NAME = "cloud-sql-python-connector"
 
+# Instance connection name is the format <PROJECT>:<REGION>:<INSTANCE>
+# Additionally, we have to support legacy "domain-scoped" projects
+# (e.g. "google.com:PROJECT")
+CONN_NAME_REGEX = re.compile(("([^:]+(:[^:]+)?):([^:]+):([^:]+)"))
+
+
+def _parse_instance_connection_name(connection_name: str) -> Tuple[str, str, str]:
+    if CONN_NAME_REGEX.fullmatch(connection_name) is None:
+        raise ValueError(
+            "Arg `instance_connection_string` must have "
+            "format: PROJECT:REGION:INSTANCE, "
+            f"got {connection_name}."
+        )
+    connection_name_split = CONN_NAME_REGEX.split(connection_name)
+    return connection_name_split[1], connection_name_split[3], connection_name_split[4]
+
 
 class IPTypes(Enum):
     PUBLIC: str = "PRIMARY"
@@ -63,7 +65,7 @@ class IPTypes(Enum):
     PSC: str = "PSC"
 
 
-class InstanceMetadata:
+class ConnectionInfo:
     ip_addrs: Dict[str, Any]
     context: ssl.SSLContext
     database_version: str
@@ -137,119 +139,43 @@ class Instance:
         string.
     :type instance_connection_string: str
 
-    :param user_agent_string:
-        The user agent string to append to SQLAdmin API requests
-    :type user_agent_string: str
-
-    :type credentials: google.auth.credentials.Credentials
-    :param credentials
-        Credentials object used to authenticate connections to Cloud SQL server.
-        If not specified, Application Default Credentials are used.
-
     :param enable_iam_auth
         Enables automatic IAM database authentication for Postgres or MySQL
         instances.
     :type enable_iam_auth: bool
-
-    :param loop:
-        A new event loop for the refresh function to run in.
-    :type loop: asyncio.AbstractEventLoop
-
-    :type quota_project: str
-    :param quota_project
-        The Project ID for an existing Google Cloud project. The project specified
-        is used for quota and billing purposes. If not specified, defaults to
-        project sourced from environment.
-
-    :type sqladmin_api_endpoint: str
-    :param sqladmin_api_endpoint:
-        Base URL to use when calling the Cloud SQL Admin API endpoint.
-        Defaults to "https://sqladmin.googleapis.com", this argument should
-        only be used in development.
     """
 
-    # asyncio.AbstractEventLoop is used because the default loop,
-    # SelectorEventLoop, is usable on both Unix and Windows but has limited
-    # functionality on Windows. It is recommended to use ProactorEventLoop
-    # while developing on Windows.
-    # Link to Github issue:
-    # https://github.com/GoogleCloudPlatform/cloud-sql-python-connector/issues/22
-    _loop: asyncio.AbstractEventLoop
-
     _enable_iam_auth: bool
-
-    __client_session: Optional[aiohttp.ClientSession] = None
-
-    @property
-    def _client_session(self) -> aiohttp.ClientSession:
-        if self.__client_session is None:
-            headers = {
-                "x-goog-api-client": self._user_agent_string,
-                "User-Agent": self._user_agent_string,
-                "Content-Type": "application/json",
-            }
-            if self._quota_project:
-                headers["x-goog-user-project"] = self._quota_project
-            self.__client_session = aiohttp.ClientSession(headers=headers)
-        return self.__client_session
-
-    _credentials: Optional[Credentials] = None
     _keys: asyncio.Future
-
     _instance_connection_string: str
-    _user_agent_string: str
-    _sqladmin_api_endpoint: str
     _instance: str
     _project: str
     _region: str
 
     _refresh_rate_limiter: AsyncRateLimiter
     _refresh_in_progress: asyncio.locks.Event
-    _current: asyncio.Task  # task wraps coroutine that returns InstanceMetadata
+    _current: asyncio.Task  # task wraps coroutine that returns ConnectionInfo
     _next: asyncio.Task  # task wraps coroutine that returns another task
 
     def __init__(
         self,
         instance_connection_string: str,
-        driver_name: str,
+        client: CloudSQLClient,
         keys: asyncio.Future,
-        loop: asyncio.AbstractEventLoop,
-        credentials: Optional[Credentials] = None,
         enable_iam_auth: bool = False,
-        quota_project: str = None,
-        sqladmin_api_endpoint: str = "https://sqladmin.googleapis.com",
     ) -> None:
-        # Validate connection string
-        connection_string_split = instance_connection_string.split(":")
-
-        if len(connection_string_split) == 3:
-            self._instance_connection_string = instance_connection_string
-            self._project = connection_string_split[0]
-            self._region = connection_string_split[1]
-            self._instance = connection_string_split[2]
-        else:
-            raise ValueError(
-                "Arg `instance_connection_string` must have "
-                "format: PROJECT:REGION:INSTANCE, "
-                f"got {instance_connection_string}."
-            )
+        # validate and parse instance connection name
+        self._project, self._region, self._instance = _parse_instance_connection_name(
+            instance_connection_string
+        )
+        self._instance_connection_string = instance_connection_string
 
         self._enable_iam_auth = enable_iam_auth
-
-        self._user_agent_string = f"{APPLICATION_NAME}/{version}+{driver_name}"
-        self._quota_project = quota_project
-        self._sqladmin_api_endpoint = sqladmin_api_endpoint
-        self._loop = loop
         self._keys = keys
-        # validate credentials type
-        if not isinstance(credentials, Credentials) and credentials is not None:
-            raise CredentialsTypeError(
-                "Arg credentials must be type 'google.auth.credentials.Credentials' "
-                "or None (to use Application Default Credentials)"
-            )
-        self._credentials = _auth_init(credentials)
+        self._client = client
         self._refresh_rate_limiter = AsyncRateLimiter(
-            max_capacity=2, rate=1 / 30, loop=self._loop
+            max_capacity=2,
+            rate=1 / 30,
         )
         self._refresh_in_progress = asyncio.locks.Event()
         self._current = self._schedule_refresh(0)
@@ -267,11 +193,11 @@ class Instance:
         if not await _is_valid(self._current):
             self._current = self._next
 
-    async def _perform_refresh(self) -> InstanceMetadata:
+    async def _perform_refresh(self) -> ConnectionInfo:
         """Retrieves instance metadata and ephemeral certificate from the
         Cloud SQL Instance.
 
-        :rtype: InstanceMetadata
+        :rtype: ConnectionInfo
         :returns: A dataclass containing a string representing the ephemeral certificate, a dict
             containing the instances IP adresses, a string representing a PEM-encoded private key
             and a string representing a PEM-encoded certificate authority.
@@ -287,22 +213,16 @@ class Instance:
 
             logger.debug(f"['{self._instance_connection_string}']: Creating context")
 
-            metadata_task = self._loop.create_task(
-                _get_metadata(
-                    self._client_session,
-                    self._sqladmin_api_endpoint,
-                    self._credentials,
+            metadata_task = asyncio.create_task(
+                self._client._get_metadata(
                     self._project,
                     self._region,
                     self._instance,
                 )
             )
 
-            ephemeral_task = self._loop.create_task(
-                _get_ephemeral(
-                    self._client_session,
-                    self._sqladmin_api_endpoint,
-                    self._credentials,
+            ephemeral_task = asyncio.create_task(
+                self._client._get_ephemeral(
                     self._project,
                     self._instance,
                     pub_key,
@@ -323,18 +243,7 @@ class Instance:
                 ephemeral_task.cancel()
                 raise
 
-            ephemeral_cert = await ephemeral_task
-
-            x509 = load_pem_x509_certificate(
-                ephemeral_cert.encode("UTF-8"), default_backend()
-            )
-            expiration = x509.not_valid_after
-
-            if self._enable_iam_auth:
-                if self._credentials is not None:
-                    token_expiration: datetime.datetime = self._credentials.expiry
-                if expiration > token_expiration:
-                    expiration = token_expiration
+            ephemeral_cert, expiration = await ephemeral_task
 
         except aiohttp.ClientResponseError as e:
             logger.debug(
@@ -353,7 +262,7 @@ class Instance:
         finally:
             self._refresh_in_progress.clear()
 
-        return InstanceMetadata(
+        return ConnectionInfo(
             ephemeral_cert,
             metadata["database_version"],
             metadata["ip_addresses"],
@@ -365,7 +274,7 @@ class Instance:
 
     def _schedule_refresh(self, delay: int) -> asyncio.Task:
         """
-        Schedule task to sleep and then perform refresh to get InstanceMetadata.
+        Schedule task to sleep and then perform refresh to get ConnectionInfo.
 
         :type delay: int
         :param delay
@@ -375,7 +284,7 @@ class Instance:
         :returns: A Task representing the scheduled _perform_refresh.
         """
 
-        async def _refresh_task(self: Instance, delay: int) -> InstanceMetadata:
+        async def _refresh_task(self: Instance, delay: int) -> ConnectionInfo:
             """
             A coroutine that sleeps for the specified amount of time before
             running _perform_refresh.
@@ -385,7 +294,7 @@ class Instance:
                 logger.debug(f"['{self._instance_connection_string}']: Entering sleep")
                 if delay > 0:
                     await asyncio.sleep(delay)
-                refresh_task = self._loop.create_task(self._perform_refresh())
+                refresh_task = asyncio.create_task(self._perform_refresh())
                 refresh_data = await refresh_task
             except asyncio.CancelledError:
                 logger.debug(
@@ -416,13 +325,13 @@ class Instance:
             return refresh_data
 
         # schedule refresh task and return it
-        scheduled_task = self._loop.create_task(_refresh_task(self, delay))
+        scheduled_task = asyncio.create_task(_refresh_task(self, delay))
         return scheduled_task
 
     async def connect_info(
         self,
         ip_type: IPTypes,
-    ) -> Tuple[InstanceMetadata, str]:
+    ) -> Tuple[ConnectionInfo, str]:
         """Retrieve instance metadata and ip address required
         for making connection to Cloud SQL instance.
 
@@ -430,7 +339,7 @@ class Instance:
         :param ip_type: Enum specifying whether to look for public
             or private IP address.
 
-        :rtype instance_data: InstanceMetadata
+        :rtype instance_data: ConnectionInfo
         :returns: Instance metadata for Cloud SQL instance.
 
         :rtype ip_address: str
@@ -441,7 +350,7 @@ class Instance:
             f"['{self._instance_connection_string}']: Entered connect_info method"
         )
 
-        instance_data: InstanceMetadata
+        instance_data: ConnectionInfo
 
         instance_data = await self._current
         ip_address: str = instance_data.get_preferred_ip(ip_type)
@@ -462,4 +371,6 @@ class Instance:
         logger.debug(
             f"['{self._instance_connection_string}']: Waiting for _client_session to close"
         )
-        await self._client_session.close()
+        # gracefully wait for tasks to cancel
+        tasks = asyncio.gather(self._current, self._next, return_exceptions=True)
+        await asyncio.wait_for(tasks, timeout=2.0)

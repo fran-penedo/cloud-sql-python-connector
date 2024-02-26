@@ -13,7 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import asyncio
+from typing import Optional
 
 
 class AsyncRateLimiter(object):
@@ -41,7 +43,7 @@ class AsyncRateLimiter(object):
         self,
         max_capacity: int = 1,
         rate: float = 1 / 60,
-        loop: asyncio.AbstractEventLoop = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         self.rate = rate
         self.max_capacity = max_capacity

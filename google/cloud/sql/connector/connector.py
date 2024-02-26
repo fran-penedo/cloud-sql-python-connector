@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,24 +22,23 @@ import logging
 import socket
 from threading import Thread
 from types import TracebackType
-from typing import Any, Dict, Optional, Type, TYPE_CHECKING
+from typing import Any, Dict, Optional, Type
+
+import google.auth
+from google.auth.credentials import Credentials
+from google.auth.credentials import with_scopes_if_required
 
 import google.cloud.sql.connector.asyncpg as asyncpg
-from google.cloud.sql.connector.exceptions import (
-    ConnectorLoopError,
-    DnsNameResolutionError,
-)
-from google.cloud.sql.connector.instance import (
-    Instance,
-    IPTypes,
-)
+from google.cloud.sql.connector.client import CloudSQLClient
+from google.cloud.sql.connector.exceptions import ConnectorLoopError
+from google.cloud.sql.connector.exceptions import DnsNameResolutionError
+from google.cloud.sql.connector.instance import Instance
+from google.cloud.sql.connector.instance import IPTypes
 import google.cloud.sql.connector.pg8000 as pg8000
 import google.cloud.sql.connector.pymysql as pymysql
 import google.cloud.sql.connector.pytds as pytds
-from google.cloud.sql.connector.utils import format_database_user, generate_keys
-
-if TYPE_CHECKING:
-    from google.auth.credentials import Credentials
+from google.cloud.sql.connector.utils import format_database_user
+from google.cloud.sql.connector.utils import generate_keys
 
 logger = logging.getLogger(name=__name__)
 
@@ -91,9 +91,10 @@ class Connector:
         enable_iam_auth: bool = False,
         timeout: int = 30,
         credentials: Optional[Credentials] = None,
-        loop: asyncio.AbstractEventLoop = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
         quota_project: Optional[str] = None,
         sqladmin_api_endpoint: str = "https://sqladmin.googleapis.com",
+        user_agent: Optional[str] = None,
     ) -> None:
         # if event loop is given, use for background tasks
         if loop:
@@ -110,14 +111,29 @@ class Connector:
                 loop=self._loop,
             )
         self._instances: Dict[str, Instance] = {}
+        self._client: Optional[CloudSQLClient] = None
 
+        # initialize credentials
+        scopes = ["https://www.googleapis.com/auth/sqlservice.admin"]
+        if credentials:
+            # verify custom credentials are proper type
+            # and atleast base class of google.auth.credentials
+            if not isinstance(credentials, Credentials):
+                raise TypeError(
+                    "credentials must be of type google.auth.credentials.Credentials,"
+                    f" got {type(credentials)}"
+                )
+            self._credentials = with_scopes_if_required(credentials, scopes=scopes)
+        # otherwise use application default credentials
+        else:
+            self._credentials, _ = google.auth.default(scopes=scopes)
         # set default params for connections
         self._timeout = timeout
         self._enable_iam_auth = enable_iam_auth
         self._ip_type = ip_type
         self._quota_project = quota_project
         self._sqladmin_api_endpoint = sqladmin_api_endpoint
-        self._credentials = credentials
+        self._user_agent = user_agent
 
     def connect(
         self, instance_connection_string: str, driver: str, **kwargs: Any
@@ -194,26 +210,31 @@ class Connector:
         # Use the Instance to establish an SSL Connection.
         #
         # Return a DBAPI connection
+        if self._client is None:
+            # lazy init client as it has to be initialized in async context
+            self._client = CloudSQLClient(
+                self._sqladmin_api_endpoint,
+                self._quota_project,
+                self._credentials,
+                user_agent=self._user_agent,
+                driver=driver,
+            )
         enable_iam_auth = kwargs.pop("enable_iam_auth", self._enable_iam_auth)
         if instance_connection_string in self._instances:
             instance = self._instances[instance_connection_string]
             if enable_iam_auth != instance._enable_iam_auth:
                 raise ValueError(
-                    f"connect() called with `enable_iam_auth={enable_iam_auth}`, "
-                    f"but previously used enable_iam_auth={instance._enable_iam_auth}`. "
+                    f"connect() called with 'enable_iam_auth={enable_iam_auth}', "
+                    f"but previously used 'enable_iam_auth={instance._enable_iam_auth}'. "
                     "If you require both for your use case, please use a new "
                     "connector.Connector object."
                 )
         else:
             instance = Instance(
                 instance_connection_string,
-                driver,
+                self._client,
                 self._keys,
-                self._loop,
-                self._credentials,
                 enable_iam_auth,
-                self._quota_project,
-                self._sqladmin_api_endpoint,
             )
             self._instances[instance_connection_string] = instance
 
@@ -311,15 +332,17 @@ class Connector:
 
     def close(self) -> None:
         """Close Connector by stopping tasks and releasing resources."""
-        close_future = asyncio.run_coroutine_threadsafe(
-            self.close_async(), loop=self._loop
-        )
-        # Will attempt to safely shut down tasks for 5s
-        close_future.result(timeout=5)
+        if self._loop.is_running():
+            close_future = asyncio.run_coroutine_threadsafe(
+                self.close_async(), loop=self._loop
+            )
+            # Will attempt to safely shut down tasks for 3s
+            close_future.result(timeout=3)
         # if background thread exists for Connector, clean it up
         if self._thread:
-            # stop event loop running in background thread
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._loop.is_running():
+                # stop event loop running in background thread
+                self._loop.call_soon_threadsafe(self._loop.stop)
             # wait for thread to finish closing (i.e. loop to stop)
             self._thread.join()
 
@@ -329,6 +352,8 @@ class Connector:
         await asyncio.gather(
             *[instance.close() for instance in self._instances.values()]
         )
+        if self._client:
+            await self._client.close()
 
 
 async def create_async_connector(
@@ -336,37 +361,61 @@ async def create_async_connector(
     enable_iam_auth: bool = False,
     timeout: int = 30,
     credentials: Optional[Credentials] = None,
-    loop: asyncio.AbstractEventLoop = None,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+    quota_project: Optional[str] = None,
+    sqladmin_api_endpoint: str = "https://sqladmin.googleapis.com",
+    user_agent: Optional[str] = None,
 ) -> Connector:
     """
-    Create Connector object for asyncio connections that can auto-detect
-    and use current thread's running event loop.
+     Create Connector object for asyncio connections that can auto-detect
+     and use current thread's running event loop.
 
     :type ip_type: IPTypes
-    :param ip_type
-        The IP type (public or private)  used to connect. IP types
-        can be either IPTypes.PUBLIC or IPTypes.PRIVATE.
+     :param ip_type
+         The IP type (public or private)  used to connect. IP types
+         can be either IPTypes.PUBLIC or IPTypes.PRIVATE.
 
-    :type enable_iam_auth: bool
-    :param enable_iam_auth
-        Enables automatic IAM database authentication for Postgres or MySQL
-        instances.
+     :type enable_iam_auth: bool
+     :param enable_iam_auth
+         Enables automatic IAM database authentication for Postgres or MySQL
+         instances.
 
-    :type timeout: int
-    :param timeout
-        The time limit for a connection before raising a TimeoutError.
+     :type timeout: int
+     :param timeout
+         The time limit for a connection before raising a TimeoutError.
 
-    :type credentials: google.auth.credentials.Credentials
-    :param credentials
-        Credentials object used to authenticate connections to Cloud SQL server.
-        If not specified, Application Default Credentials are used.
+     :type credentials: google.auth.credentials.Credentials
+     :param credentials
+         Credentials object used to authenticate connections to Cloud SQL server.
+         If not specified, Application Default Credentials are used.
 
-    :type loop: asyncio.AbstractEventLoop
-    :param loop
-        Event loop to run asyncio tasks, if not specified, defaults
-        to current thread's running event loop.
+     :type quota_project: str
+     :param quota_project
+         The Project ID for an existing Google Cloud project. The project specified
+         is used for quota and billing purposes. If not specified, defaults to
+         project sourced from environment.
+
+     :type loop: asyncio.AbstractEventLoop
+     :param loop
+         Event loop to run asyncio tasks, if not specified, defaults to
+         creating new event loop on background thread.
+
+     :type sqladmin_api_endpoint: str
+     :param sqladmin_api_endpoint:
+         Base URL to use when calling the Cloud SQL Admin API endpoint.
+         Defaults to "https://sqladmin.googleapis.com", this argument should
+         only be used in development.
     """
     # if no loop given, automatically detect running event loop
     if loop is None:
         loop = asyncio.get_running_loop()
-    return Connector(ip_type, enable_iam_auth, timeout, credentials, loop)
+    return Connector(
+        ip_type=ip_type,
+        enable_iam_auth=enable_iam_auth,
+        timeout=timeout,
+        credentials=credentials,
+        loop=loop,
+        quota_project=quota_project,
+        sqladmin_api_endpoint=sqladmin_api_endpoint,
+        user_agent=user_agent,
+    )

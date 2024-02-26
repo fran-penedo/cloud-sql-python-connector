@@ -13,20 +13,8 @@
 # limitations under the License.
 import io
 import os
-from setuptools import setup, find_packages
 
-package_root = os.path.abspath(os.path.dirname(__file__))
-
-readme_filename = os.path.join(package_root, "README.md")
-with io.open(readme_filename, encoding="utf-8") as readme_file:
-    readme = readme_file.read()
-
-packages = [package for package in find_packages() if package.startswith("google")]
-
-# Determine which namespaces are needed.
-namespaces = ["google"]
-if "google.cloud" in packages:
-    namespaces.append("google.cloud")
+import setuptools
 
 name = "cloud-sql-python-connector"
 description = (
@@ -35,21 +23,35 @@ description = (
     " permissions to connect to a Cloud SQL database without having"
     " to manually allowlist IPs or manage SSL certificates."
 )
-
-version = {}
-with open("google/cloud/sql/connector/version.py") as fp:
-    exec(fp.read(), version)
-version = version["__version__"]
-
 release_status = "Development Status :: 5 - Production/Stable"
-core_dependencies = [
+dependencies = [
     "aiohttp",
-    "cryptography>=38.0.3",
+    "cryptography>=42.0.0",
     "Requests",
     "google-auth",
 ]
 
-setup(
+package_root = os.path.abspath(os.path.dirname(__file__))
+
+readme_filename = os.path.join(package_root, "README.md")
+with io.open(readme_filename, encoding="utf-8") as readme_file:
+    readme = readme_file.read()
+
+version = {}
+with open(os.path.join(package_root, "google/cloud/sql/connector/version.py")) as fp:
+    exec(fp.read(), version)
+version = version["__version__"]
+
+# Only include packages under the 'google' namespace. Do not include tests,
+# samples, etc.
+packages = [
+    package
+    for package in setuptools.find_namespace_packages()
+    if package.startswith("google")
+]
+
+
+setuptools.setup(
     name=name,
     version=version,
     description=description,
@@ -68,16 +70,16 @@ setup(
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
     platforms="Posix; MacOS X; Windows",
     packages=packages,
-    namespace_packages=namespaces,
-    install_requires=core_dependencies,
+    install_requires=dependencies,
     extras_require={
-        "pymysql": ["PyMySQL==1.1.0"],
-        "pg8000": ["pg8000==1.30.2"],
-        "pytds": ["python-tds==1.13.0"],
-        "asyncpg": ["asyncpg==0.28.0"]
+        "pymysql": ["PyMySQL>=1.1.0"],
+        "pg8000": ["pg8000>=1.30.5"],
+        "pytds": ["python-tds>=1.15.0"],
+        "asyncpg": ["asyncpg>=0.29.0"],
     },
     python_requires=">=3.8",
     include_package_data=True,
